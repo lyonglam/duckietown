@@ -1,0 +1,458 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Duckietown Navigator</title>
+<style>
+  :root {
+    --bg:#0f1117; --surface:#1a1d27; --border:#2a2d3a;
+    --yellow:#f5c518; --yellow-dim:#7a6209; --red:#e03030;
+    --green:#2ecc71; --blue:#4a9eff; --text:#e8eaf0; --muted:#6b6f80;
+    --tile:72px; --r:6px;
+  }
+  *{box-sizing:border-box;margin:0;padding:0;}
+  body{background:var(--bg);color:var(--text);font-family:'Courier New',monospace;min-height:100vh;display:flex;flex-direction:column;}
+  header{padding:14px 24px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:16px;}
+  header h1{font-size:1.1rem;font-weight:700;letter-spacing:.12em;color:var(--yellow);text-transform:uppercase;}
+  header span{font-size:.75rem;color:var(--muted);}
+  .layout{display:flex;flex:1;}
+  .grid-panel{padding:24px;display:flex;flex-direction:column;align-items:center;gap:14px;flex:1;}
+  .grid{display:grid;grid-template-columns:repeat(6,var(--tile));grid-template-rows:repeat(7,var(--tile));gap:2px;}
+  .tile{width:var(--tile);height:var(--tile);background:#141720;border:1px solid #1e2130;border-radius:3px;
+    display:flex;align-items:center;justify-content:center;cursor:pointer;position:relative;
+    font-size:.6rem;transition:border-color .15s,background .15s;user-select:none;}
+  .tile:hover:not(.grass){border-color:var(--yellow-dim);}
+  .tile.grass{background:#0d1a10;cursor:default;}
+  .tile.grass:hover{border-color:#1e2130;}
+  .tile.road{background:#1c2030;}
+  .tile.intersection{background:#222640;border-color:#f5c51833;}
+  .tile.start{background:#1a3020!important;border-color:var(--green)!important;}
+  .tile.goal{background:#2a1a1a!important;border-color:var(--red)!important;}
+  .tile.path{background:#1e2840!important;border-color:var(--blue)!important;}
+  .tile.intersection.path{background:#1e2840!important;border-color:var(--blue)!important;}
+  .stopbar{position:absolute;bottom:3px;left:8px;right:8px;height:3px;background:var(--red);opacity:.55;border-radius:2px;pointer-events:none;}
+  .tile-label{position:absolute;bottom:2px;right:3px;font-size:.5rem;color:var(--muted);pointer-events:none;}
+  .heading-arrow{position:absolute;font-size:1.3rem;pointer-events:none;color:var(--green);}
+  .goal-icon{position:absolute;font-size:1.1rem;pointer-events:none;}
+  .side{width:290px;background:var(--surface);border-left:1px solid var(--border);padding:18px;display:flex;flex-direction:column;gap:16px;overflow-y:auto;}
+  .sec-title{font-size:.68rem;letter-spacing:.15em;text-transform:uppercase;color:var(--muted);margin-bottom:7px;}
+  .info-box{background:#12141e;border:1px solid var(--border);border-radius:var(--r);padding:11px;font-size:.8rem;line-height:1.8;}
+  .lbl{color:var(--muted);} .val{color:var(--text);font-weight:600;}
+  .val.g{color:var(--green);} .val.r{color:var(--red);} .val.y{color:var(--yellow);} .val.b{color:var(--blue);}
+  .btn{width:100%;padding:10px;border:none;border-radius:var(--r);font-family:'Courier New',monospace;
+    font-size:.78rem;font-weight:700;letter-spacing:.1em;text-transform:uppercase;cursor:pointer;transition:opacity .15s,transform .1s;}
+  .btn:active{transform:scale(.98);} .btn:disabled{opacity:.35;cursor:not-allowed;}
+  .btn-y{background:var(--yellow);color:#0f1117;} .btn-g{background:var(--green);color:#0f1117;}
+  .btn-m{background:var(--border);color:var(--text);}
+  .btn-row{display:flex;gap:8px;} .btn-row .btn{flex:1;}
+  .hpick{display:flex;gap:6px;}
+  .hbtn{flex:1;padding:8px 4px;border:1px solid var(--border);background:#12141e;color:var(--muted);
+    border-radius:var(--r);cursor:pointer;font-size:.85rem;font-family:'Courier New',monospace;text-align:center;transition:all .15s;}
+  .hbtn.active{border-color:var(--yellow);background:#1e1a08;color:var(--yellow);}
+  .tlist{display:flex;flex-direction:column;gap:4px;max-height:200px;overflow-y:auto;}
+  .ti{display:flex;align-items:center;gap:8px;padding:6px 10px;background:#12141e;border-radius:4px;border-left:3px solid var(--border);font-size:.74rem;}
+  .ti.straight{border-left-color:var(--blue);} .ti.left{border-left-color:var(--yellow);}
+  .ti.right{border-left-color:var(--green);} .ti.stop{border-left-color:var(--red);}
+  .ta{font-weight:700;text-transform:uppercase;min-width:64px;}
+  .ta.straight{color:var(--blue);} .ta.left{color:var(--yellow);} .ta.right{color:var(--green);} .ta.stop{color:var(--red);}
+  .tc{color:var(--muted);font-size:.68rem;}
+  .robot-row{display:flex;gap:6px;margin-bottom:8px;}
+  .robot-row input{flex:1;background:#12141e;border:1px solid var(--border);border-radius:var(--r);
+    color:var(--text);padding:8px;font-family:'Courier New',monospace;font-size:.78rem;}
+  .robot-row input:focus{outline:none;border-color:var(--yellow-dim);}
+  .log{background:#0a0c12;border:1px solid var(--border);border-radius:var(--r);padding:10px;
+    font-size:.7rem;color:var(--muted);max-height:90px;overflow-y:auto;line-height:1.7;}
+  .log .ok{color:var(--green);} .log .err{color:var(--red);} .log .info{color:var(--blue);}
+  .hint{font-size:.7rem;color:var(--muted);text-align:center;}
+  .legend{display:flex;gap:10px;flex-wrap:wrap;font-size:.68rem;color:var(--muted);}
+  .ld{display:flex;align-items:center;gap:4px;}
+  .ldot{width:10px;height:10px;border-radius:2px;border:1px solid;}
+</style>
+</head>
+<body>
+<header>
+  <h1>🦆 Duckietown Navigator</h1>
+  <span>duck4 · 7×6 · A* (Person 3 graph)</span>
+</header>
+<div class="layout">
+  <div class="grid-panel">
+    <div class="grid" id="grid"></div>
+    <div class="legend">
+      <div class="ld"><div class="ldot" style="background:#1a3020;border-color:#2ecc71"></div>Start</div>
+      <div class="ld"><div class="ldot" style="background:#2a1a1a;border-color:#e03030"></div>Goal</div>
+      <div class="ld"><div class="ldot" style="background:#1e2840;border-color:#4a9eff"></div>Path</div>
+      <div class="ld"><div class="ldot" style="background:#222640;border-color:#f5c51855"></div>Intersection</div>
+    </div>
+    <div class="hint" id="hint">Click a drivable tile to set START</div>
+  </div>
+
+  <div class="side">
+    <div>
+      <div class="sec-title">Selection</div>
+      <div class="info-box">
+        <div><span class="lbl">Start: </span><span class="val g" id="iStart">—</span></div>
+        <div><span class="lbl">Facing: </span><span class="val y" id="iFacing">—</span></div>
+        <div><span class="lbl">Goal: </span><span class="val r" id="iGoal">—</span></div>
+      </div>
+    </div>
+
+    <div id="hSection" style="display:none">
+      <div class="sec-title">Start Heading</div>
+      <div class="hpick">
+        <button class="hbtn" data-h="0">↑ N</button>
+        <button class="hbtn" data-h="1">→ E</button>
+        <button class="hbtn" data-h="2">↓ S</button>
+        <button class="hbtn" data-h="3">← W</button>
+      </div>
+    </div>
+
+    <div>
+      <div class="sec-title">Actions</div>
+      <button class="btn btn-y" id="btnFind" disabled>▶ Find Path</button>
+      <div class="btn-row" style="margin-top:8px">
+        <button class="btn btn-m" id="btnReset">↺ Reset</button>
+        <button class="btn btn-m" id="btnRoam">⟳ Roam</button>
+      </div>
+    </div>
+
+    <div id="pSection" style="display:none">
+      <div class="sec-title">Path Info</div>
+      <div class="info-box">
+        <div><span class="lbl">Tiles: </span><span class="val b" id="iTiles">—</span></div>
+        <div><span class="lbl">Turns: </span><span class="val b" id="iInters">—</span></div>
+        <div><span class="lbl">Distance: </span><span class="val b" id="iDist">—</span></div>
+      </div>
+    </div>
+
+    <div id="tSection" style="display:none">
+      <div class="sec-title">Turn List → Robot</div>
+      <div class="tlist" id="tList"></div>
+    </div>
+
+    <div>
+      <div class="sec-title">Robot</div>
+      <div class="robot-row">
+        <input id="rHost" value="duck4" placeholder="duck4">
+        <input id="rPort" value="8083" placeholder="8083" style="width:70px;flex:none">
+      </div>
+      <button class="btn btn-g" id="btnSend" disabled>⬆ Send to duck4</button>
+    </div>
+
+    <div>
+      <div class="sec-title">Log</div>
+      <div class="log" id="log"><span class="info">Ready.</span></div>
+    </div>
+  </div>
+</div>
+
+<script>
+// ── Person 3's tile graph ──────────────────────────────────
+const DIRS = {N:[-1,0],S:[1,0],E:[0,1],W:[0,-1]};
+const TILE_CONNECTIONS = {
+  '0,2':{N:'E',W:'S'}, '0,3':{E:'E',W:'W'}, '0,4':{E:'E',W:'W'}, '0,5':{N:'W',E:'S'},
+  '1,1':{N:'E',W:'S'}, '1,2':{S:'W',E:'N'}, '1,5':{N:'N',S:'S'},
+  '2,0':{N:'E',W:'S'}, '2,1':{S:'W',E:'N'}, '2,3':{N:'E',W:'S'}, '2,4':{E:'E',W:'W'},
+  '2,5':{E:['N','S'],S:['S','W'],N:['N','W']},
+  '3,0':{N:'N',S:'S'}, '3,3':{N:'N',S:'S'}, '3,5':{N:'N',S:'S'},
+  '4,0':{S:['S','E'],N:['N','E'],W:['N','S']},
+  '4,1':{E:'E',W:'W'}, '4,2':{E:'E',W:'W'},
+  '4,3':{E:['E','N','S'],W:['W','N','S'],N:['N','E','W'],S:['S','E','W']},
+  '4,4':{E:'E',W:'W'},
+  '4,5':{E:['N','S'],S:['S','W'],N:['N','W']},
+  '5,0':{N:'N',S:'S'}, '5,3':{N:'N',S:'S'}, '5,5':{N:'N',S:'S'},
+  '6,0':{S:'E',W:'N'}, '6,1':{E:'E',W:'W'}, '6,2':{E:'E',W:'W'},
+  '6,3':{S:['E','W'],E:['E','N'],W:['W','N']},
+  '6,4':{E:'E',W:'W'}, '6,5':{S:'W',E:'N'},
+};
+const INTERS = new Set(['2,5','4,0','4,3','4,5','6,3']);
+const ROWS=7, COLS=6, TILE_M=0.585;
+const H_NAME=['N','E','S','W'], H_ARR=['↑','→','↓','←'];
+
+function isDrivable(r,c){return `${r},${c}` in TILE_CONNECTIONS;}
+function isInter(r,c){return INTERS.has(`${r},${c}`);}
+
+function getNeighbours(r,c,f){
+  const k=`${r},${c}`;
+  if(!TILE_CONNECTIONS[k]) return [];
+  let exits=TILE_CONNECTIONS[k][f];
+  if(!exits) return [];
+  if(!Array.isArray(exits)) exits=[exits];
+  return exits.map(d=>{const[dr,dc]=DIRS[d];return{r:r+dr,c:c+dc,f:d};});
+}
+
+// ── A* (direction-aware states) ────────────────────────────
+function astar(sr,sc,sf,gr,gc){
+  const start=`${sr},${sc},${sf}`, goal=`${gr},${gc}`;
+  const open=[{s:start,f:0,g:0}], gS={[start]:0}, came={};
+  while(open.length){
+    open.sort((a,b)=>a.f-b.f);
+    const{s:cur}=open.shift();
+    const[cr,cc,cf]=cur.split(',');
+    if(`${cr},${cc}`===goal) return reconstruct(came,cur);
+    for(const nb of getNeighbours(+cr,+cc,cf)){
+      const ns=`${nb.r},${nb.c},${nb.f}`;
+      const tg=(gS[cur]||0)+1;
+      if(tg<(gS[ns]??Infinity)){
+        came[ns]=cur; gS[ns]=tg;
+        const h=Math.abs(nb.r-gr)+Math.abs(nb.c-gc);
+        open.push({s:ns,f:tg+h,g:tg});
+      }
+    }
+  }
+  return null;
+}
+function reconstruct(came,cur){
+  const p=[cur];while(came[cur]){cur=came[cur];p.unshift(cur);}return p;
+}
+
+// ── Turn list ──────────────────────────────────────────────
+function pathToTurns(path){
+  if(!path||path.length<2) return [];
+  const turns=[];
+  for(let i=0;i<path.length-1;i++){
+    const[r,c,fi]=path[i].split(',');
+    const[,,fo]=path[i+1].split(',');
+    if(isInter(+r,+c)){
+      turns.push({intersection:`${r},${c}`,action:h2action(fi,fo),h_in:fi,h_out:fo});
+    }
+  }
+  const[lr,lc,lf]=path[path.length-1].split(',');
+  if(isInter(+lr,+lc)) turns.push({intersection:`${lr},${lc}`,action:'stop',h_in:lf,h_out:lf});
+  return turns;
+}
+function h2action(i,o){
+  const dirs=['N','E','S','W'];
+  const d=((dirs.indexOf(o)-dirs.indexOf(i))+4)%4;
+  if(d===0) return 'straight'; if(d===1) return 'right'; if(d===3) return 'left'; return 'u_turn';
+}
+
+// ── State ──────────────────────────────────────────────────
+let mode='set_start', startR=null,startC=null,startH=0, goalR=null,goalC=null;
+let currentPath=null, currentTurns=null;
+
+// ── Grid ───────────────────────────────────────────────────
+function buildGrid(){
+  const g=document.getElementById('grid'); g.innerHTML='';
+  for(let r=0;r<ROWS;r++) for(let c=0;c<COLS;c++){
+    const el=document.createElement('div');
+    el.className='tile';
+    el.dataset.r=r; el.dataset.c=c;
+    if(!isDrivable(r,c)) el.classList.add('grass');
+    else if(isInter(r,c)) el.classList.add('intersection');
+    else el.classList.add('road');
+    if(isInter(r,c)){const sb=document.createElement('div');sb.className='stopbar';el.appendChild(sb);}
+    const lbl=document.createElement('div');lbl.className='tile-label';lbl.textContent=`${r},${c}`;el.appendChild(lbl);
+    el.addEventListener('click',()=>onTile(r,c));
+    g.appendChild(el);
+  }
+}
+
+function getEl(r,c){return document.querySelector(`.tile[data-r="${r}"][data-c="${c}"]`);}
+
+function refreshGrid(){
+  document.querySelectorAll('.tile').forEach(el=>{
+    el.classList.remove('start','goal','path');
+    el.querySelector('.heading-arrow')?.remove();
+    el.querySelector('.goal-icon')?.remove();
+  });
+  const pathSet=new Set();
+  if(currentPath) currentPath.forEach(s=>{const[r,c]=s.split(',');pathSet.add(`${r},${c}`);});
+  pathSet.forEach(k=>{const[r,c]=k.split(',');getEl(+r,+c)?.classList.add('path');});
+  if(startR!==null){
+    const el=getEl(startR,startC);
+    if(el){el.classList.remove('path');el.classList.add('start');
+      const a=document.createElement('span');a.className='heading-arrow';a.textContent=H_ARR[startH];el.appendChild(a);}
+  }
+  if(goalR!==null){
+    const el=getEl(goalR,goalC);
+    if(el){el.classList.remove('path');el.classList.add('goal');
+      const g=document.createElement('span');g.className='goal-icon';g.textContent='🎯';el.appendChild(g);}
+  }
+}
+
+// ── Tile click ─────────────────────────────────────────────
+function onTile(r,c){
+  if(!isDrivable(r,c)) return;
+  if(mode==='set_start'){
+    startR=r;startC=c;goalR=null;goalC=null;currentPath=null;currentTurns=null;
+    document.getElementById('iStart').textContent=`(${r},${c})`;
+    document.getElementById('hSection').style.display='';
+    document.getElementById('pSection').style.display='none';
+    document.getElementById('tSection').style.display='none';
+    document.getElementById('btnFind').disabled=true;
+    document.getElementById('btnSend').disabled=true;
+    log('info',`Start → (${r},${c})`);
+    mode='set_goal'; updateHint();
+  } else {
+    if(r===startR&&c===startC){log('err','Goal = start');return;}
+    goalR=r;goalC=c;
+    document.getElementById('iGoal').textContent=`(${r},${c})`;
+    document.getElementById('btnFind').disabled=false;
+    log('info',`Goal → (${r},${c})`);
+    mode='set_start'; updateHint();
+  }
+  refreshGrid();
+}
+
+// ── Heading picker ─────────────────────────────────────────
+document.querySelectorAll('.hbtn').forEach(b=>{
+  b.addEventListener('click',()=>{
+    document.querySelectorAll('.hbtn').forEach(x=>x.classList.remove('active'));
+    b.classList.add('active');
+    startH=+b.dataset.h;
+    document.getElementById('iFacing').textContent=H_NAME[startH];
+    refreshGrid();
+  });
+});
+document.querySelector('.hbtn[data-h="0"]').classList.add('active');
+
+// ── Find path ──────────────────────────────────────────────
+document.getElementById('btnFind').addEventListener('click',()=>{
+  if(startR===null||goalR===null){log('err','Set start and goal');return;}
+  const facingStr=H_NAME[startH];
+  const p=astar(startR,startC,facingStr,goalR,goalC);
+  if(!p){log('err',`No path from (${startR},${startC}) facing ${facingStr}`);return;}
+  currentPath=p;
+  currentTurns=pathToTurns(p);
+  refreshGrid();
+  renderTurns(currentTurns);
+  const dist=((p.length-1)*TILE_M).toFixed(2);
+  document.getElementById('iTiles').textContent=p.length;
+  document.getElementById('iInters').textContent=currentTurns.filter(t=>t.action!=='stop').length;
+  document.getElementById('iDist').textContent=dist+' m';
+  document.getElementById('pSection').style.display='';
+  document.getElementById('tSection').style.display='';
+  document.getElementById('btnSend').disabled=false;
+  log('ok',`Path: ${p.length} tiles, ${currentTurns.filter(t=>t.action!=='stop').length} turns, ${dist}m`);
+});
+
+// ── Reset ──────────────────────────────────────────────────
+document.getElementById('btnReset').addEventListener('click',()=>{
+  startR=startC=goalR=goalC=null;currentPath=currentTurns=null;mode='set_start';startH=0;
+  ['iStart','iFacing','iGoal'].forEach(id=>document.getElementById(id).textContent='—');
+  document.getElementById('hSection').style.display='none';
+  document.getElementById('pSection').style.display='none';
+  document.getElementById('tSection').style.display='none';
+  document.getElementById('btnFind').disabled=true;
+  document.getElementById('btnSend').disabled=true;
+  document.getElementById('tList').innerHTML='';
+  document.querySelectorAll('.hbtn').forEach(b=>b.classList.remove('active'));
+  document.querySelector('.hbtn[data-h="0"]').classList.add('active');
+  refreshGrid(); updateHint(); log('info','Reset.');
+});
+
+// ── Roam ───────────────────────────────────────────────────
+document.getElementById('btnRoam').addEventListener('click',()=>{
+  const tiles=[];
+  for(let r=0;r<ROWS;r++) for(let c=0;c<COLS;c++) if(isDrivable(r,c)) tiles.push([r,c]);
+  const pick=(ex)=>{let t;do{t=tiles[Math.floor(Math.random()*tiles.length)];}while(ex&&t[0]===ex[0]&&t[1]===ex[1]);return t;};
+  const [sr,sc]=pick(null), [gr,gc]=pick([sr,sc]);
+  const h=Math.floor(Math.random()*4);
+  startR=sr;startC=sc;goalR=gr;goalC=gc;startH=h;mode='set_start';
+  document.getElementById('iStart').textContent=`(${sr},${sc})`;
+  document.getElementById('iGoal').textContent=`(${gr},${gc})`;
+  document.getElementById('iFacing').textContent=H_NAME[h];
+  document.getElementById('hSection').style.display='';
+  document.getElementById('btnFind').disabled=false;
+  document.querySelectorAll('.hbtn').forEach(b=>b.classList.remove('active'));
+  document.querySelector(`.hbtn[data-h="${h}"]`).classList.add('active');
+  currentPath=null;currentTurns=null;refreshGrid();updateHint();
+  document.getElementById('btnFind').click();
+});
+
+// ── Send commands to Duckiebot /navigate endpoint ─────────────
+function buildCommandPayload(){
+  if(!currentTurns || !currentTurns.length) return null;
+
+  // Convert the detailed frontend turn objects into the simple command array
+  // expected by the Flask server: { commands: ["straight", "left", ...] }
+  const commands = currentTurns.map(t => t.action);
+
+  // The robot should always receive a final stop command.
+  if(commands[commands.length - 1] !== 'stop') commands.push('stop');
+
+  // Reject commands that your current Flask server does not support.
+  const allowed = new Set(['straight', 'left', 'right', 'stop']);
+  const invalid = commands.filter(cmd => !allowed.has(cmd));
+  if(invalid.length){
+    throw new Error(`Unsupported command(s): ${[...new Set(invalid)].join(', ')}`);
+  }
+
+  return { commands };
+}
+
+document.getElementById('btnSend').addEventListener('click', async () => {
+  let payload;
+
+  try{
+    payload = buildCommandPayload();
+    if(!payload){
+      log('err', 'No commands to send');
+      return;
+    }
+  }catch(e){
+    log('err', e.message);
+    return;
+  }
+
+  const host = document.getElementById('rHost').value.trim() || 'duck4';
+  const port = document.getElementById('rPort').value.trim() || '8083';
+  const url = `http://${host}:${port}/navigate`;
+
+  log('info', `POST ${url}`);
+  log('info', JSON.stringify(payload));
+
+  try{
+    const r = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(payload)
+    });
+
+    const text = await r.text();
+
+    if(r.ok) log('ok', `Sent commands! (${r.status}) ${text}`);
+    else log('err', `HTTP ${r.status}: ${text}`);
+  }catch(e){
+    log('err', `Cannot reach robot: ${e.message}`);
+  }
+});
+
+// ── Turn list render ───────────────────────────────────────
+function renderTurns(turns){
+  const el=document.getElementById('tList');
+  if(!turns||!turns.length){el.innerHTML='<div style="color:var(--muted);font-size:.74rem">No intersections on path.</div>';return;}
+  const icons={straight:'↑',left:'↰',right:'↱',stop:'■',u_turn:'↩'};
+  el.innerHTML=turns.map((t,i)=>`
+    <div class="ti ${t.action}">
+      <span style="color:var(--muted);min-width:16px">${i+1}</span>
+      <span class="ta ${t.action}">${icons[t.action]||''} ${t.action}</span>
+      <span class="tc">${t.intersection} · ${t.h_in}→${t.h_out}</span>
+    </div>`).join('');
+}
+
+// ── Log ────────────────────────────────────────────────────
+function log(type,msg){
+  const el=document.getElementById('log');
+  const d=document.createElement('div');
+  d.className=type;
+  const ts=new Date().toLocaleTimeString('en',{hour12:false,hour:'2-digit',minute:'2-digit',second:'2-digit'});
+  d.textContent=`[${ts}] ${msg}`;
+  el.appendChild(d);
+  el.scrollTop=el.scrollHeight;
+  while(el.children.length>30) el.removeChild(el.firstChild);
+}
+
+function updateHint(){
+  document.getElementById('hint').textContent=
+    mode==='set_start'?'Click a drivable tile to set START':'Click a drivable tile to set GOAL';
+}
+
+buildGrid();
+updateHint();
+</script>
+</body>
+</html>
