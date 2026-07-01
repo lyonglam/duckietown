@@ -50,6 +50,10 @@
   .hbtn{flex:1;padding:8px 4px;border:1px solid var(--border);background:#12141e;color:var(--muted);
     border-radius:var(--r);cursor:pointer;font-size:.85rem;font-family:'Courier New',monospace;text-align:center;transition:all .15s;}
   .hbtn.active{border-color:var(--yellow);background:#1e1a08;color:var(--yellow);}
+  .hbtn.eligible{border-color:var(--green);}
+  .hbtn.ineligible{border-color:var(--red);}
+  .hbtn.eligible.active{border-color:var(--green);}
+  .hbtn.ineligible.active{border-color:var(--red);}
   .tlist{display:flex;flex-direction:column;gap:4px;max-height:200px;overflow-y:auto;}
   .ti{display:flex;align-items:center;gap:8px;padding:6px 10px;background:#12141e;border-radius:4px;border-left:3px solid var(--border);font-size:.74rem;}
   .ti.straight{border-left-color:var(--blue);} .ti.left{border-left-color:var(--yellow);}
@@ -250,6 +254,20 @@ function buildGrid(){
 
 function getEl(r,c){return document.querySelector(`.tile[data-r="${r}"][data-c="${c}"]`);}
 
+function updateHeadingEligibility(){
+  const startKey=startR===null?null:`${startR},${startC}`;
+  const allowed=startKey?new Set(Object.keys(TILE_CONNECTIONS[startKey]||{})):null;
+  document.querySelectorAll('.hbtn').forEach(b=>{
+    b.classList.remove('eligible','ineligible');
+    b.removeAttribute('title');
+    if(!allowed) return;
+    const heading=H_NAME[+b.dataset.h];
+    const ok=allowed.has(heading);
+    b.classList.add(ok?'eligible':'ineligible');
+    b.title=ok?'Eligible start heading':'Ineligible start heading';
+  });
+}
+
 function refreshGrid(){
   document.querySelectorAll('.tile').forEach(el=>{
     el.classList.remove('start','goal','path');
@@ -283,7 +301,7 @@ function onTile(r,c){
     document.getElementById('btnFind').disabled=true;
     document.getElementById('btnSend').disabled=true;
     log('info',`Start → (${r},${c})`);
-    mode='set_goal'; updateHint();
+    mode='set_goal'; updateHeadingEligibility(); updateHint();
   } else {
     if(r===startR&&c===startC){log('err','Goal = start');return;}
     goalR=r;goalC=c;
@@ -302,6 +320,7 @@ document.querySelectorAll('.hbtn').forEach(b=>{
     b.classList.add('active');
     startH=+b.dataset.h;
     document.getElementById('iFacing').textContent=H_NAME[startH];
+    updateHeadingEligibility();
     refreshGrid();
   });
 });
@@ -339,7 +358,7 @@ document.getElementById('btnReset').addEventListener('click',()=>{
   document.getElementById('tList').innerHTML='';
   document.querySelectorAll('.hbtn').forEach(b=>b.classList.remove('active'));
   document.querySelector('.hbtn[data-h="0"]').classList.add('active');
-  refreshGrid(); updateHint(); log('info','Reset.');
+  updateHeadingEligibility(); refreshGrid(); updateHint(); log('info','Reset.');
 });
 
 // ── Roam ───────────────────────────────────────────────────
@@ -357,7 +376,7 @@ document.getElementById('btnRoam').addEventListener('click',()=>{
   document.getElementById('btnFind').disabled=false;
   document.querySelectorAll('.hbtn').forEach(b=>b.classList.remove('active'));
   document.querySelector(`.hbtn[data-h="${h}"]`).classList.add('active');
-  currentPath=null;currentTurns=null;refreshGrid();updateHint();
+  currentPath=null;currentTurns=null;updateHeadingEligibility();refreshGrid();updateHint();
   document.getElementById('btnFind').click();
 });
 
@@ -452,6 +471,7 @@ function updateHint(){
 }
 
 buildGrid();
+updateHeadingEligibility();
 updateHint();
 </script>
 </body>
