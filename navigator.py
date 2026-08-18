@@ -66,7 +66,7 @@ import cv2
 import numpy as np
 import rospy
 from duckietown_msgs.msg import Twist2DStamped
-from sensor_msgs.msg import CompressedImage
+from sensor_msgs.msg import CompressedImage, Range
 
 VEHICLE = os.environ.get("VEHICLE_NAME", "duck4")
 THRESHOLD_FILE = os.environ.get("HSV_FILE", "/data/hsv_thresholds.json")
@@ -145,6 +145,56 @@ LANE_REACQUIRE_TOL = 0.28  # lane counts as "ahead" if within this fraction of c
 # clears the intersection and settles in a lane before stopping.
 FINISH_S = 3.0
 
+# ---- obstacle avoidance, using the TIME-OF-FLIGHT range sensor ----
+# Set False to disable entirely and get plain navigation back.
+AVOIDANCE_ENABLED = True
+
+# WHY DISTANCE AND NOT THE CAMERA: a rubber duckie is the same colour family as the
+# yellow centre line, and shape does not separate them either -- perspective squashes a
+# near dash into the same compact blob a duckie makes, so the same markings measured
+# elongation 1.1 to 2.4 across consecutive frames. The ToF sensor sidesteps all of it:
+# a duckie STANDS UP and returns a short range, flat tape on the road returns nothing.
+#
+# Just as important, this detector never touches the vision pipeline. It cannot corrupt
+# the yellow mask or the centre line, so a false reading can no longer break lane
+# following the way the camera-based attempt did.
+#
+# Approach follows the previous TUM batch (Duckietown-Btown,
+# packages/obstacle_detection/src/tof_obstacle_detection_node.py): read sensor_msgs/Range
+# and apply hysteresis so a reading hovering at the limit cannot chatter. Their numbers
+# (detect 0.12 m) are for STOPPING; we swerve, so we need to see it further out.
+TOF_TOPIC = os.environ.get(
+    "TOF_TOPIC", "/{}/front_center_tof_driver_node/range".format(VEHICLE))
+TOF_DETECT_M = 0.35      # closer than this = something is in the way
+TOF_CLEAR_M = 0.50       # must get beyond this to count as clear again (hysteresis)
+TOF_MIN_VALID_M = 0.02   # below this the reading is noise, not an object
+TOF_STALE_S = 2.0        # no messages for this long = sensor is not working
+
+# The swerve itself: no scripted manoeuvre. We stay in closed-loop lane following and
+# slide the TARGET across the centre line.
+#   ramp 0.0 = our lane, 0.5 = straddling the line, 1.0 = oncoming lane
+AVOID_RAMP_RATE = 0.055  # how fast the target slides per frame
+AVOID_HOLD_S = 2.0       # stay out this long after the obstacle stops being seen
+AVOID_MAX_S = 8.0        # never sit in the oncoming lane longer than this
+
+# ---- HOW FAR THE SWERVE GOES. This is the knob to turn. ----
+# Fraction of image width the target shifts LEFT at full swerve:
+#   0.50 = full mirror, ends up a half-lane past the centre line (aggressive)
+#   0.35 = sits just left of the centre line (default, enough to clear a duckie)
+#   0.25 = rides exactly on the centre line (very gentle)
+#   0.15 = barely moves over
+# Raise it to swerve wider, lower it if the bot swings too far.
+AVOID_SHIFT_FRAC = 0.35
+
+# Steering is CLAMPED during a swerve. Without this the large lateral error commands
+# near-full lock and the bot pirouettes instead of easing across.
+AVOID_OMEGA_MAX = 2.2
+
+# While swerving, the centre line ends up on our RIGHT. The normal left-hand search
+# window would miss it completely, yc would go None, and the lane-lost handler would
+# hold the last hard turn -- which is exactly how a swerve becomes a 180. Widen it.
+YELLOW_SEARCH_SWERVE = 0.95
+
 DEFAULT_THRESHOLDS = {
     "yellow": {"lower": [15, 80, 80], "upper": [40, 255, 255]},
     "white": {"lower": [0, 0, 170], "upper": [180, 70, 255]},
@@ -208,12 +258,21 @@ class Navigator:
         self.ignore_red_until = rospy.Time.now()
         self.last_command = None
         self.finish_at = None       # set after the last command: settle, then stop
+        self.ramp = 0.0             # 0 = our lane, 1 = oncoming lane
+        self.avoid_until = None
+        self.avoid_started = None
+        self.obstacle = False       # latched by the ToF callback, with hysteresis
+        self.tof_range = None
+        self.tof_stamp = None
 
         self.pub = rospy.Publisher(
             "/{}/car_cmd_switch_node/cmd".format(VEHICLE), Twist2DStamped, queue_size=1)
         rospy.Subscriber(
             "/{}/camera_node/image/compressed".format(VEHICLE), CompressedImage,
             self.cb_image, queue_size=1, buff_size=2 ** 24)
+        if AVOIDANCE_ENABLED:
+            rospy.Subscriber(TOF_TOPIC, Range, self.cb_tof, queue_size=1)
+            rospy.loginfo("[navigator] obstacle avoidance ON, listening on %s", TOF_TOPIC)
 
         self.start_http()
         rospy.on_shutdown(self.stop)
@@ -261,6 +320,9 @@ class Navigator:
                 "total": self.plan_total,
                 "last_command": self.last_command,
                 "done": self.state == "DONE" and not self.plan,
+                "avoiding": round(self.ramp, 2),
+                "obstacle": self.obstacle,
+                "tof_m": None if self.tof_range is None else round(self.tof_range, 3),
             }
 
     def follow_only(self):
@@ -312,6 +374,74 @@ class Navigator:
 
     # ================= states =================
 
+    def cb_tof(self, msg):
+        """
+        Front range sensor. Hysteresis (detect near, clear further out) stops a reading
+        that sits right on the limit from flickering the swerve on and off.
+
+        Readings below TOF_MIN_VALID_M are sensor noise. The VL53L0X also reports
+        out-of-range as a large value, which simply fails the detect test, so "nothing
+        there" needs no special case.
+        """
+        self.tof_range = msg.range
+        self.tof_stamp = rospy.Time.now()
+        if msg.range < TOF_MIN_VALID_M:
+            return
+        if not self.obstacle and msg.range < TOF_DETECT_M:
+            self.obstacle = True
+            rospy.loginfo("[navigator] obstacle at %.2f m", msg.range)
+        elif self.obstacle and msg.range > TOF_CLEAR_M:
+            self.obstacle = False
+            rospy.loginfo("[navigator] obstacle cleared (%.2f m)", msg.range)
+
+    def tof_alive(self):
+        """False if the sensor has gone quiet -- better to say so than silently coast."""
+        if self.tof_stamp is None:
+            return False
+        return (rospy.Time.now() - self.tof_stamp).to_sec() < TOF_STALE_S
+
+    def update_avoidance(self, yc):
+        """
+        Move `ramp` toward where we want to be, one step per frame. Ramping rather than
+        switching is what makes the swerve smooth instead of a lurch.
+        """
+        if not AVOIDANCE_ENABLED:
+            return
+        now = rospy.Time.now()
+
+        if not self.tof_alive():
+            rospy.logwarn_throttle(
+                5.0, "[navigator] no ToF data on %s -- avoidance inactive", TOF_TOPIC)
+            self.obstacle = False
+
+        if self.obstacle:
+            if self.avoid_started is None:
+                rospy.loginfo("[navigator] swerving into the other lane")
+                self.avoid_started = now
+            self.avoid_until = now + rospy.Duration(AVOID_HOLD_S)
+
+        # Safety valve: never sit in the oncoming lane indefinitely.
+        if (self.avoid_started is not None
+                and (now - self.avoid_started).to_sec() > AVOID_MAX_S):
+            rospy.logwarn_throttle(2.0,
+                                   "[navigator] avoidance timed out -- returning to lane")
+            self.avoid_until = now
+            self.obstacle = False
+
+        want = 1.0 if (self.avoid_until is not None and now < self.avoid_until) else 0.0
+        if yc is None:
+            want = self.ramp     # no centre line to measure against: hold, don't lurch
+
+        if want > self.ramp:
+            self.ramp = min(1.0, self.ramp + AVOID_RAMP_RATE)
+        elif want < self.ramp:
+            self.ramp = max(0.0, self.ramp - AVOID_RAMP_RATE)
+
+        if self.ramp <= 0.001 and self.avoid_started is not None and want == 0.0:
+            rospy.loginfo("[navigator] back in our lane")
+            self.avoid_started = None
+            self.avoid_until = None
+
     def do_lane_follow(self, hsv, width):
         # Route finished: we've been settling in the lane, now actually stop.
         if self.finish_at is not None and rospy.Time.now() > self.finish_at:
@@ -323,7 +453,9 @@ class Navigator:
 
         # Find each line only where it can legitimately be: yellow centerline on our
         # left, our white edge on our right.
-        yc = centroid_x(self.mask_for(hsv, "yellow"), x_hi=width * YELLOW_SEARCH_MAX)
+        swerving = self.ramp > 0.001
+        y_gate = YELLOW_SEARCH_SWERVE if swerving else YELLOW_SEARCH_MAX
+        yc = centroid_x(self.mask_for(hsv, "yellow"), x_hi=width * y_gate)
         wc = centroid_x(self.mask_for(hsv, "white"), x_lo=width * WHITE_SEARCH_MIN)
         center = width / 2.0
 
@@ -332,9 +464,15 @@ class Navigator:
             rospy.logwarn_throttle(2.0, "[navigator] white line looks wrong -- ignoring")
             wc = None
 
+        self.update_avoidance(yc)
+
         # Stop line, but only in OUR lane -- a red line across the oncoming lane is not
         # ours to obey, and stopping for it would also miscount the plan.
-        if rospy.Time.now() > self.ignore_red_until:
+        # Suppressed mid-swerve: we are on the wrong side of the road, so the lane-relative
+        # reasoning does not hold and a bogus trigger would desync the whole plan.
+        if self.ramp > 0.001:
+            rospy.logwarn_throttle(3.0, "[navigator] swerving -- stop lines ignored")
+        elif rospy.Time.now() > self.ignore_red_until:
             red = self.mask_for(hsv, "red")
             red_cut = int(yc) if yc is not None else int(width * RED_LANE_MIN)
             red[:, :max(0, red_cut)] = 0
@@ -346,7 +484,16 @@ class Navigator:
                 self.drive(0.0, 0.0)
                 return
 
-        if yc is not None and wc is not None:
+        if self.ramp > 0.001 and yc is not None:
+            # Swerving. Steer relative to the CENTRE LINE and slide the target from its
+            # right side to its left:
+            #   ramp 0 -> yc + half lane (our lane)
+            #   ramp .5 -> yc            (straddling the line)
+            #   ramp 1 -> yc - half lane (oncoming lane)
+            # White-edge logic is skipped: past the centre line the left/right geometry
+            # is mirrored and would fight the swerve.
+            lane_center = yc + width * (HALF_LANE_FRAC - AVOID_SHIFT_FRAC * self.ramp)
+        elif yc is not None and wc is not None:
             lane_center = (yc + wc) / 2.0
         elif yc is not None:
             lane_center = yc + width * HALF_LANE_FRAC
@@ -355,8 +502,15 @@ class Navigator:
         else:
             # Hold the turn rather than straightening -- straightening mid-curve is what
             # carries the bot out of its lane.
-            rospy.logwarn_throttle(2.0, "[navigator] lane lost -- holding turn")
             self.lost_frames += 1
+            if self.ramp > 0.001:
+                # Mid-swerve: do NOT hold the turn. Holding a hard turn with no reference
+                # is what spins the bot right around. Straighten up and coast instead.
+                rospy.logwarn_throttle(2.0, "[navigator] lane lost mid-swerve -- coasting")
+                self.last_omega = 0.0
+                self.drive(V_MIN, 0.0)
+                return
+            rospy.logwarn_throttle(2.0, "[navigator] lane lost -- holding turn")
             if self.lost_frames <= LANE_LOST_MAX_FRAMES:
                 self.last_omega *= LANE_MEMORY_DECAY
                 self.drive(V_MIN, self.last_omega)
@@ -368,7 +522,8 @@ class Navigator:
         error = (lane_center - center) / center
         d_error = error - self.prev_error
         self.prev_error = error
-        omega = float(np.clip(-(KP * error + KD * d_error), -OMEGA_MAX, OMEGA_MAX))
+        cap = AVOID_OMEGA_MAX if self.ramp > 0.001 else OMEGA_MAX
+        omega = float(np.clip(-(KP * error + KD * d_error), -cap, cap))
         v = max(V_MIN, V_BAR * (1.0 - SLOWDOWN_STRENGTH * error * error))
         self.last_omega = omega
         self.drive(v, omega)
