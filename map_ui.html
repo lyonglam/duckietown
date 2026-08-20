@@ -105,6 +105,12 @@
       <div class="card" style="margin-bottom:16px">
         <h2>Plan</h2>
         <div class="row">
+          <button id="locate">Locate robot</button>
+          <span style="font-size:12.5px;color:var(--muted)">reads the floor AprilTag,
+            fills in the start tile</span>
+        </div>
+        <div id="loc"></div>
+        <div class="row">
           <span style="font-size:13px;color:var(--muted)">Facing:</span>
           <button data-f="N">N ↑</button><button data-f="E">E →</button>
           <button data-f="S">S ↓</button><button data-f="W">W ←</button>
@@ -374,8 +380,9 @@ function draw(){
 
 function validFacings(rc){ return rc ? Object.keys(TC[key(rc[0],rc[1])]) : []; }
 
+function setStart(r,c){ start = [r,c]; goal = null; facing = validFacings(start)[0]; }
 function pick(r,c){
-  if(!start || (start && goal)){ start = [r,c]; goal = null; facing = validFacings(start)[0]; }
+  if(!start || (start && goal)){ setStart(r,c); }
   else if(!goal){ goal = [r,c]; }
   replan();
 }
@@ -472,10 +479,44 @@ document.getElementById("abort").addEventListener("click", async () => {
   }catch(e){ say("err","Could not reach the robot: "+e.message); }
 });
 
+// ---------------------------------------------------------------------------
+// AprilTag localization: ask the robot which tile it is on (POST /localize) and
+// pre-fill the START tile from the answer -- same effect as clicking the tile, so
+// it can still be overridden by clicking. The tag gives the TILE only; facing
+// stays manual, exactly as before.
+// ---------------------------------------------------------------------------
+const loc = document.getElementById("loc");
+const sayLoc = (cls,msg) => loc.innerHTML = `<div class="msg ${cls}">${msg}</div>`;
+const locBtn = document.getElementById("locate");
+locBtn.addEventListener("click", async () => {
+  locBtn.disabled = true;
+  locBtn.textContent = "Locating…";
+  try{
+    const r = await fetch(base()+"/localize", {method:"POST"});
+    const j = await r.json();
+    if(!j.localized)
+      return sayLoc("err", "Not localized: " + (j.reason || ("HTTP "+r.status)) +
+        "<br>Pick the start tile by clicking the map instead.");
+    if(!TC[key(j.row,j.col)])
+      return sayLoc("err", `Robot reports tile (${j.row},${j.col}), which is not ` +
+        "a road tile on this map - check apriltag_map.json.");
+    setStart(j.row, j.col);
+    replan();
+    sayLoc("ok", `Located at (${j.row},${j.col}) - tag ${j.tag_id}, confidence ` +
+      `${j.confidence}. Set the facing, then click the destination.`);
+  }catch(e){
+    sayLoc("err", "Could not reach the robot: " + e.message +
+      "<br>Pick the start tile by clicking the map instead.");
+  }finally{
+    locBtn.disabled = false;
+    locBtn.textContent = "Locate robot";
+  }
+});
+
 document.querySelectorAll("[data-f]").forEach(b =>
   b.addEventListener("click", () => { facing = b.dataset.f; replan(); }));
 document.getElementById("reset").addEventListener("click", () => {
-  start = goal = facing = plan = null; net.innerHTML = ""; replan();
+  start = goal = facing = plan = null; net.innerHTML = ""; loc.innerHTML = ""; replan();
 });
 document.getElementById("swap").addEventListener("click", () => {
   if(!start || !goal) return;

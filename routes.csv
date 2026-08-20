@@ -1,0 +1,9 @@
+route,started,planned,n_planned,n_executed,duration_s,completed,stuck,stuck_timeout
+1,2026-08-20T16:23:26,right left straight stop,3,3,55.2,True,0,0
+2,2026-08-20T16:25:13,left right right stop,3,3,60.9,True,0,0
+3,2026-08-20T16:26:57,straight left right right stop,4,4,83.1,True,0,0
+4,2026-08-20T16:28:53,right left left stop,3,3,65.5,True,1,0
+5,2026-08-20T16:30:25,straight straight left right straight stop,5,5,117.6,True,2,0
+6,2026-08-20T16:32:44,right left straight right left stop,5,5,92.9,True,0,0
+7,2026-08-20T16:35:03,right straight left straight stop,4,4,74.2,True,0,0
+8,2026-08-20T16:36:56,right left left left left stop,5,5,142.9,False,1,1
