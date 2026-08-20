@@ -20,6 +20,10 @@ so the web app needs no changes -- it just points at the robot instead of the la
 
     POST http://duck4.local:8083/abort      -> stops the robot and clears the plan
 
+    POST http://duck4.local:8083/localize   -> reads the tile's AprilTag (robot must be
+         idle), returns {"localized": true, "row": 2, "col": 0, "tag_id": 7,
+         "confidence": 54.0} or {"localized": false, "reason": "..."}
+
 It uses Python's built-in http.server (no Flask dependency, which the bot's containers
 may not have). The server runs in a background thread; ROS work stays on the main thread.
 
@@ -35,6 +39,7 @@ HOW THE STATE MACHINE WORKS
     LANE_FOLLOW -- normal driving, watching for a red stop line
     AT_STOP_LINE -- red seen: brake, pause, pop the next command
     TURNING      -- creep in, then rotate until a lane is visible ahead again
+    STUCK        -- lane lost too long: stop, watch for the lane, warn the operator
     DONE         -- plan finished (or no plan): sit still
 
 IMPORTANT -- THIS COUNTS STOP LINES
@@ -68,6 +73,21 @@ import rospy
 from duckietown_msgs.msg import Twist2DStamped
 from sensor_msgs.msg import CompressedImage, Range
 
+# Run logging is OPTIONAL. This file's whole point is "one file you can paste onto the
+# bot" -- it must still run if run_logger.py never made the trip. All logging goes
+# through self.log_event(), which no-ops when the module is missing.
+try:
+    from run_logger import RunLogger
+except ImportError:
+    RunLogger = None
+
+# AprilTag localization is OPTIONAL, same deal as run logging: the node must still run
+# on a bot where pupil_apriltags was never installed. See localize().
+try:
+    from pupil_apriltags import Detector
+except ImportError:
+    Detector = None
+
 VEHICLE = os.environ.get("VEHICLE_NAME", "duck4")
 THRESHOLD_FILE = os.environ.get("HSV_FILE", "/data/hsv_thresholds.json")
 HTTP_PORT = int(os.environ.get("NAV_PORT", "8083"))
@@ -95,6 +115,12 @@ HALF_LANE_FRAC = 0.25
 RED_LANE_MIN = 0.30
 LANE_MEMORY_DECAY = 0.85
 LANE_LOST_MAX_FRAMES = 15
+# After LANE_LOST_MAX_FRAMES the bot used to stop SILENTLY -- mid-route that looked
+# like a dead robot, with no hint in the logs or /status. Now it enters STUCK instead:
+# stays stopped, keeps watching for the lane, recovers on its own if the lane comes
+# back, and nags the terminal once the wait gets long.
+STUCK_RECOVER_FRAMES = 5  # consecutive frames with a lane before trusting recovery
+STUCK_TIMEOUT_S = 30.0    # STUCK longer than this -> periodic operator warnings
 
 # ---- stop line detection ----
 RED_MIN_AREA = 3000      # red pixels needed to call it a stop line
@@ -195,6 +221,24 @@ AVOID_OMEGA_MAX = 2.2
 # hold the last hard turn -- which is exactly how a swerve becomes a 180. Widen it.
 YELLOW_SEARCH_SWERVE = 0.95
 
+# ---- AprilTag self-localization ----
+# Tags (tag36h11) are mounted flat on the ROAD tiles of the 7x6 grid -- 30 of them; the
+# rest of the grid is empty space with no tag. Before a route starts, POST /localize
+# reads the tag under the camera and reports which tile the bot is on, so the planner
+# no longer has to be told the start tile. Facing is deliberately OUT OF SCOPE: only
+# tag_id / decision_margin / center are read, no pose estimation.
+# Set False to disable; /localize then answers "disabled" instead of detecting.
+APRILTAG_ENABLED = True
+APRILTAG_MAP_FILE = os.environ.get(
+    "APRILTAG_MAP",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "apriltag_map.json"))
+# One frame can misread; sample several and take a majority vote on the tag id.
+LOCALIZE_SAMPLE_FRAMES = 5
+LOCALIZE_MIN_MARGIN = 20.0    # decision_margin below ~20 is borderline (measured with
+                              # apriltag_scan_test.py) -- discard those samples
+LOCALIZE_MIN_VALID = 2        # need at least this many confident samples to answer
+LOCALIZE_FRAME_TIMEOUT_S = 2.0  # max wait for ONE fresh camera frame
+
 DEFAULT_THRESHOLDS = {
     "yellow": {"lower": [15, 80, 80], "upper": [40, 255, 255]},
     "white": {"lower": [0, 0, 170], "upper": [180, 70, 255]},
@@ -217,6 +261,24 @@ def load_thresholds():
         rospy.logwarn("[navigator] no %s -- using DEFAULTS. Run hsv_calibrator.py!",
                       THRESHOLD_FILE)
         return DEFAULT_THRESHOLDS
+
+
+def load_tag_map():
+    """
+    tag id (as a STRING -- JSON keys) -> {"row", "col"} for the 30 road tiles.
+    Returns None if the file is missing/broken: the node still starts and /localize
+    reports a clear failure, instead of the whole navigator dying for a side feature.
+    """
+    try:
+        with open(APRILTAG_MAP_FILE) as f:
+            data = json.load(f)
+        rospy.loginfo("[navigator] apriltag map: %d tags from %s",
+                      len(data), APRILTAG_MAP_FILE)
+        return data
+    except Exception as e:
+        rospy.logerr("[navigator] cannot load %s (%s) -- /localize will not work",
+                     APRILTAG_MAP_FILE, e)
+        return None
 
 
 def centroid_x(mask, x_lo=None, x_hi=None):
@@ -248,6 +310,7 @@ class Navigator:
         self.prev_error = 0.0
         self.last_omega = 0.0       # steering memory for when the lines drop out
         self.lost_frames = 0
+        self.recover_frames = 0     # consecutive lane sightings while STUCK
 
         self.lock = threading.Lock()
         self.plan = []              # commands still to execute
@@ -264,6 +327,31 @@ class Navigator:
         self.obstacle = False       # latched by the ToF callback, with hysteresis
         self.tof_range = None
         self.tof_stamp = None
+
+        # Evidence file for the report: success rates, timings, stuck counts. See
+        # run_logger.py (writer) and analyze_runs.py (reader).
+        self.runlog = RunLogger() if RunLogger is not None else None
+        if self.runlog is None:
+            rospy.logwarn("[navigator] run_logger.py not found -- run logging OFF")
+        self.stuck_timeout_logged = False   # one stuck_timeout event per episode
+
+        # AprilTag self-localization (POST /localize). latest_frame is the ONLY frame
+        # cache: cb_image overwrites it every frame, localize() reads it. frame_seq
+        # lets localize() wait for genuinely NEW frames instead of re-reading one.
+        self.latest_frame = None
+        self.frame_seq = 0
+        self.localized_tile = None      # {"row","col"} after a good localize
+        self.last_localization = None   # full last result (success or failure), for /status
+        self.localize_lock = threading.Lock()   # one detection run at a time
+        self.tag_map = load_tag_map() if APRILTAG_ENABLED else None
+        if APRILTAG_ENABLED and Detector is not None:
+            # Same setup as apriltag_scan_test.py: tag36h11 ONLY.
+            self.tag_detector = Detector(families="tag36h11")
+        else:
+            self.tag_detector = None
+            if APRILTAG_ENABLED:
+                rospy.logwarn("[navigator] pupil_apriltags not installed -- /localize "
+                              "disabled. pip install pupil-apriltags")
 
         self.pub = rospy.Publisher(
             "/{}/car_cmd_switch_node/cmd".format(VEHICLE), Twist2DStamped, queue_size=1)
@@ -301,6 +389,7 @@ class Navigator:
             self.last_command = None
             self.finish_at = None
         rospy.loginfo("[navigator] new plan (%d turns): %s", self.plan_total, commands)
+        self.log_event("plan_started", commands=list(commands), count=self.plan_total)
         return True, "ok"
 
     def abort(self):
@@ -320,9 +409,11 @@ class Navigator:
                 "total": self.plan_total,
                 "last_command": self.last_command,
                 "done": self.state == "DONE" and not self.plan,
+                "stuck": self.state == "STUCK",
                 "avoiding": round(self.ramp, 2),
                 "obstacle": self.obstacle,
                 "tof_m": None if self.tof_range is None else round(self.tof_range, 3),
+                "last_localization": self.last_localization,
             }
 
     def follow_only(self):
@@ -356,6 +447,9 @@ class Navigator:
         frame = cv2.imdecode(np.frombuffer(msg.data, np.uint8), cv2.IMREAD_COLOR)
         if frame is None:
             return
+        # Cache for localize() -- newest frame wins, nothing else uses this.
+        self.latest_frame = frame
+        self.frame_seq += 1
         h, w = frame.shape[:2]
         roi = frame[int(h * (1.0 - ROI_FRACTION)):, :]
         hsv = cv2.GaussianBlur(cv2.cvtColor(roi, cv2.COLOR_BGR2HSV), (5, 5), 0)
@@ -371,6 +465,8 @@ class Navigator:
             self.do_stop_line()
         elif state == "TURNING":
             self.do_turn(hsv, w)
+        elif state == "STUCK":
+            self.do_stuck(hsv, w)
 
     # ================= states =================
 
@@ -417,6 +513,8 @@ class Navigator:
         if self.obstacle:
             if self.avoid_started is None:
                 rospy.loginfo("[navigator] swerving into the other lane")
+                self.log_event("avoidance_start", tof_m=None if self.tof_range is None
+                               else round(self.tof_range, 3))
                 self.avoid_started = now
             self.avoid_until = now + rospy.Duration(AVOID_HOLD_S)
 
@@ -439,6 +537,8 @@ class Navigator:
 
         if self.ramp <= 0.001 and self.avoid_started is not None and want == 0.0:
             rospy.loginfo("[navigator] back in our lane")
+            self.log_event("avoidance_end",
+                           duration_s=round((now - self.avoid_started).to_sec(), 1))
             self.avoid_started = None
             self.avoid_until = None
 
@@ -446,6 +546,7 @@ class Navigator:
         # Route finished: we've been settling in the lane, now actually stop.
         if self.finish_at is not None and rospy.Time.now() > self.finish_at:
             rospy.loginfo("[navigator] route complete -- stopping")
+            self.log_event("route_complete")
             self.finish_at = None
             self.enter("DONE")
             self.drive(0.0, 0.0)
@@ -515,6 +616,13 @@ class Navigator:
                 self.last_omega *= LANE_MEMORY_DECAY
                 self.drive(V_MIN, self.last_omega)
             else:
+                rospy.logwarn("[navigator] lane lost for %d frames -- giving up and "
+                              "entering STUCK (stopped, watching for the lane)",
+                              self.lost_frames)
+                self.log_event("stuck_entered", lost_frames=self.lost_frames)
+                self.recover_frames = 0
+                self.stuck_timeout_logged = False
+                self.enter("STUCK")
                 self.drive(0.0, 0.0)
             return
 
@@ -543,8 +651,156 @@ class Navigator:
             self.last_command = command
 
         rospy.loginfo("[navigator] executing '%s' (%d left)", command, len(self.plan))
+        self.log_event("command_executed", command=command, remaining=len(self.plan))
         self.maneuver = (self.phases_for(command), 0, rospy.Time.now())
         self.enter("TURNING")
+
+    def do_stuck(self, hsv, width):
+        """Lane lost for too long: sit still, watch for the lane, recover if it returns."""
+        self.drive(0.0, 0.0)
+
+        # Same detection lane following uses -- we just look, we don't steer.
+        yc = centroid_x(self.mask_for(hsv, "yellow"), x_hi=width * YELLOW_SEARCH_MAX)
+        wc = centroid_x(self.mask_for(hsv, "white"), x_lo=width * WHITE_SEARCH_MIN)
+        if yc is not None and wc is not None and wc <= yc + MIN_LANE_WIDTH_PX:
+            wc = None
+
+        if yc is not None or wc is not None:
+            # One lucky frame is not a recovery -- require a streak.
+            self.recover_frames += 1
+            if self.recover_frames >= STUCK_RECOVER_FRAMES:
+                stuck_s = (rospy.Time.now() - self.state_since).to_sec()
+                rospy.loginfo("[navigator] lane visible again after %.1fs STUCK -- "
+                              "resuming lane follow", stuck_s)
+                self.log_event("stuck_recovered", stuck_s=round(stuck_s, 1))
+                self.prev_error = 0.0
+                self.last_omega = 0.0
+                self.lost_frames = 0
+                self.recover_frames = 0
+                self.enter("LANE_FOLLOW")
+            return
+        self.recover_frames = 0
+
+        stuck_s = (rospy.Time.now() - self.state_since).to_sec()
+        if stuck_s > STUCK_TIMEOUT_S:
+            if not self.stuck_timeout_logged:   # ONE event per episode, not per frame
+                self.stuck_timeout_logged = True
+                self.log_event("stuck_timeout", stuck_s=round(stuck_s, 1))
+            rospy.logwarn_throttle(
+                5.0, "[navigator] STUCK for %.0fs -- no lane in sight, robot needs help",
+                stuck_s)
+
+    # ================= apriltag localization =================
+
+    def grab_fresh_frame(self, last_seq):
+        """Wait for a frame NEWER than last_seq. Returns (frame, seq) or (None, seq)."""
+        deadline = time.time() + LOCALIZE_FRAME_TIMEOUT_S
+        while time.time() < deadline:
+            if self.frame_seq != last_seq and self.latest_frame is not None:
+                return self.latest_frame, self.frame_seq
+            time.sleep(0.02)
+        return None, last_seq
+
+    def localize(self):
+        """
+        Which tile is the bot parked on? Reads the tile's AprilTag and answers from
+        apriltag_map.json. Only meaningful while IDLE -- mid-route the camera points
+        wherever the route put it, and we must not fight the lane pipeline for frames.
+        Returns the response dict for the HTTP layer; also stored for /status.
+        """
+        if not APRILTAG_ENABLED:
+            return {"localized": False, "reason": "apriltag localization disabled"}
+        if self.tag_detector is None:
+            return {"localized": False,
+                    "reason": "pupil_apriltags not installed on the bot"}
+        if self.tag_map is None:
+            return {"localized": False,
+                    "reason": "apriltag_map.json missing or unreadable"}
+        with self.lock:
+            if self.state != "DONE":
+                return {"localized": False,
+                        "reason": "route active (state %s) -- localize only while idle"
+                                  % self.state}
+        if not self.localize_lock.acquire(False):
+            return {"localized": False, "reason": "localization already in progress"}
+        try:
+            result = self.sample_and_vote()
+        finally:
+            self.localize_lock.release()
+        with self.lock:
+            self.last_localization = result
+            self.localized_tile = ({"row": result["row"], "col": result["col"]}
+                                   if result["localized"] else None)
+        return result
+
+    def sample_and_vote(self):
+        """
+        The actual detection: up to LOCALIZE_SAMPLE_FRAMES fresh frames, majority vote
+        on tag id. Distinguishes the three ways it can fail -- nothing seen, seen but
+        low confidence, frames disagreeing -- because each needs a different fix
+        (tag placement / distance / duplicate tags in view).
+        """
+        votes = {}              # tag_id -> [decision_margins]
+        frames_seen = 0
+        frames_with_tag = 0
+        seq = self.frame_seq
+        for _ in range(LOCALIZE_SAMPLE_FRAMES):
+            frame, seq = self.grab_fresh_frame(seq)
+            if frame is None:
+                break           # camera went quiet: judge from what we already have
+            frames_seen += 1
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            tags = self.tag_detector.detect(gray)
+            if not tags:
+                continue
+            frames_with_tag += 1
+            # More than one tag in view: the clearest one is the one we're on.
+            best = max(tags, key=lambda t: t.decision_margin)
+            if best.decision_margin < LOCALIZE_MIN_MARGIN:
+                continue
+            votes.setdefault(int(best.tag_id), []).append(best.decision_margin)
+
+        if frames_seen == 0:
+            rospy.logwarn("[navigator] localize: no camera frames -- camera down?")
+            return {"localized": False, "reason": "no camera frames"}
+        if not votes:
+            if frames_with_tag:
+                rospy.logwarn("[navigator] localize: tag seen in %d/%d frames but every "
+                              "margin was below %.0f -- too far or bad angle",
+                              frames_with_tag, frames_seen, LOCALIZE_MIN_MARGIN)
+                return {"localized": False,
+                        "reason": "tag visible but below confidence threshold"}
+            rospy.logwarn("[navigator] localize: no tag detected in %d frames",
+                          frames_seen)
+            return {"localized": False, "reason": "no tag detected"}
+
+        total_valid = sum(len(m) for m in votes.values())
+        tag_id, margins = max(votes.items(), key=lambda kv: len(kv[1]))
+        if len(margins) < LOCALIZE_MIN_VALID:
+            rospy.logwarn("[navigator] localize: only %d confident sample(s) of %d "
+                          "frames -- not enough to trust", len(margins), frames_seen)
+            return {"localized": False, "reason": "too few confident samples"}
+        if len(margins) * 2 <= total_valid:
+            counts = {t: len(m) for t, m in votes.items()}
+            rospy.logwarn("[navigator] localize: frames disagree on the tag id %s -- "
+                          "two tags in view?", counts)
+            return {"localized": False,
+                    "reason": "frames disagree on tag id: %s" % counts}
+
+        info = self.tag_map.get(str(tag_id))
+        if info is None:
+            rospy.logwarn("[navigator] localize: tag %d is not in %s -- map out of "
+                          "date?", tag_id, APRILTAG_MAP_FILE)
+            return {"localized": False,
+                    "reason": "tag %d not in apriltag_map.json" % tag_id}
+
+        confidence = round(max(margins), 1)
+        result = {"localized": True, "row": info["row"], "col": info["col"],
+                  "tag_id": tag_id, "confidence": confidence}
+        rospy.loginfo("[navigator] localized: tag %d -> tile (%d,%d) "
+                      "(margin %.0f, %d/%d frames)", tag_id, info["row"], info["col"],
+                      confidence, len(margins), frames_seen)
+        return result
 
     def phases_for(self, command):
         """
@@ -635,11 +891,18 @@ class Navigator:
                 self.finish_at = rospy.Time.now() + rospy.Duration(FINISH_S)
                 rospy.loginfo("[navigator] final maneuver done -> settling for %.1fs",
                               FINISH_S)
+        self.log_event("maneuver_done", command=self.last_command,
+                       remaining=len(self.plan))
 
     def enter(self, state):
         with self.lock:
             self.state = state
             self.state_since = rospy.Time.now()
+
+    def log_event(self, event, **data):
+        """Append one event to the run log file. Safe to call with logging disabled."""
+        if self.runlog is not None:
+            self.runlog.log(event, **data)
 
     # ================= motion =================
 
@@ -736,6 +999,9 @@ class Navigator:
                 if self.path.startswith("/follow"):
                     nav.follow_only()
                     self._send(200, {"status": "following"})
+                    return
+                if self.path.startswith("/localize"):
+                    self._send(200, nav.localize())
                     return
                 if not self.path.startswith("/navigate"):
                     self._send(404, {"error": "not found"})
