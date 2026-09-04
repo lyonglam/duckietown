@@ -82,11 +82,24 @@ except ImportError:
     RunLogger = None
 
 # AprilTag localization is OPTIONAL, same deal as run logging: the node must still run
-# on a bot where pupil_apriltags was never installed. See localize().
-try:
-    from pupil_apriltags import Detector
-except ImportError:
-    Detector = None
+# on a bot where no tag library was ever installed. See localize().
+#
+# Two interchangeable builds of the same AprilTag3 bindings, tried in order:
+#   dt_apriltags     - Duckietown's fork. Prebuilt aarch64 wheels, works with the old
+#                      numpy (1.17) these robots ship. This is the one that installs.
+#   pupil_apriltags  - no aarch64 wheel, so pip tries to compile it and the build fails
+#                      on this image; recent releases also need numpy >= 1.20.
+# Both expose Detector(families=...) and .detect(gray) returning objects with .tag_id,
+# .decision_margin and .center, which is all localize() below touches.
+Detector = None
+APRILTAG_LIB = None
+for _lib in ("dt_apriltags", "pupil_apriltags"):
+    try:
+        Detector = __import__(_lib, fromlist=["Detector"]).Detector
+        APRILTAG_LIB = _lib
+        break
+    except ImportError:
+        pass
 
 VEHICLE = os.environ.get("VEHICLE_NAME", "duck4")
 THRESHOLD_FILE = os.environ.get("HSV_FILE", "/data/hsv_thresholds.json")
@@ -195,6 +208,14 @@ TOF_DETECT_M = 0.35      # closer than this = something is in the way
 TOF_CLEAR_M = 0.50       # must get beyond this to count as clear again (hysteresis)
 TOF_MIN_VALID_M = 0.02   # below this the reading is noise, not an object
 TOF_STALE_S = 2.0        # no messages for this long = sensor is not working
+# How many consecutive short readings before we believe an obstacle is really there.
+# The sensor runs at ~15 Hz, so 5 frames is about a third of a second. This is what
+# stops bright flat things on the road -- AprilTags above all, since white reflects
+# strongly where dark tape returns almost nothing -- from tripping a swerve as the bot
+# drives over them. RAISE it if tags still trigger; LOWER it if real obstacles are
+# noticed too late.
+TOF_CONFIRM_FRAMES = 5
+TOF_DEBUG = True         # log the live range about once a second, to tune the above
 
 # The swerve itself: no scripted manoeuvre. We stay in closed-loop lane following and
 # slide the TARGET across the centre line.
@@ -238,6 +259,22 @@ LOCALIZE_MIN_MARGIN = 20.0    # decision_margin below ~20 is borderline (measure
                               # apriltag_scan_test.py) -- discard those samples
 LOCALIZE_MIN_VALID = 2        # need at least this many confident samples to answer
 LOCALIZE_FRAME_TIMEOUT_S = 2.0  # max wait for ONE fresh camera frame
+
+# ---- LIVE TILE TRACKING (optional, for the map in the browser) ----
+# /localize is a one-shot answer taken while the robot is parked. This is the other
+# thing: keep reading tags WHILE driving so the map can show where the robot is.
+#
+# It is deliberately OFF by default. Tag detection on every frame would compete with
+# lane following for CPU on the Jetson, and lane following is the part that must never
+# stutter. When on, we detect on every Nth frame only, and the whole thing is wrapped so
+# that a detector failure can never take down the driving loop.
+#
+# Turn it on here, or without editing the file:  export LIVE_TRACKING=1
+LIVE_TRACKING = os.environ.get("LIVE_TRACKING", "0") not in ("0", "", "false", "False")
+LIVE_EVERY_N_FRAMES = 6       # camera is ~30 fps, so this samples at ~5 Hz
+LIVE_MIN_MARGIN = 25.0        # stricter than LOCALIZE_MIN_MARGIN: showing the WRONG
+                              # tile on the map is worse than showing none
+LIVE_STALE_S = 5.0            # older than this and the map should stop trusting it
 
 DEFAULT_THRESHOLDS = {
     "yellow": {"lower": [15, 80, 80], "upper": [40, 255, 255]},
@@ -325,6 +362,13 @@ class Navigator:
         self.avoid_until = None
         self.avoid_started = None
         self.obstacle = False       # latched by the ToF callback, with hysteresis
+        self.tof_near_count = 0     # consecutive short readings, see cb_tof
+        self.live_tile = None       # last tile seen while driving (live tracking)
+        # The AprilTag detector is a C library and is NOT thread safe. Two callers
+        # reach it: update_live_tile() from the ROS camera thread, and localize()
+        # from an HTTP request thread. Running both at once corrupts the heap and
+        # segfaults the process. Every detect() call must hold this lock.
+        self.detector_lock = threading.Lock()
         self.tof_range = None
         self.tof_stamp = None
 
@@ -414,6 +458,8 @@ class Navigator:
                 "obstacle": self.obstacle,
                 "tof_m": None if self.tof_range is None else round(self.tof_range, 3),
                 "last_localization": self.last_localization,
+                "live_tile": self.live_tile_status(),
+                "live_tracking": LIVE_TRACKING,
             }
 
     def follow_only(self):
@@ -450,6 +496,15 @@ class Navigator:
         # Cache for localize() -- newest frame wins, nothing else uses this.
         self.latest_frame = frame
         self.frame_seq += 1
+
+        # Live tile tracking, if enabled. Every Nth frame only, and never allowed to
+        # raise: driving must not stop because a tag lookup went wrong.
+        if (LIVE_TRACKING and self.tag_detector is not None
+                and self.frame_seq % LIVE_EVERY_N_FRAMES == 0):
+            try:
+                self.update_live_tile(frame)
+            except Exception as e:
+                rospy.logwarn_throttle(10.0, "[navigator] live tracking error: %s", e)
         h, w = frame.shape[:2]
         roi = frame[int(h * (1.0 - ROI_FRACTION)):, :]
         hsv = cv2.GaussianBlur(cv2.cvtColor(roi, cv2.COLOR_BGR2HSV), (5, 5), 0)
@@ -481,14 +536,78 @@ class Navigator:
         """
         self.tof_range = msg.range
         self.tof_stamp = rospy.Time.now()
+        if TOF_DEBUG:
+            rospy.loginfo_throttle(1.0, "[navigator] tof %.3f m  near_count=%d  obstacle=%s",
+                                   msg.range, self.tof_near_count, self.obstacle)
         if msg.range < TOF_MIN_VALID_M:
             return
-        if not self.obstacle and msg.range < TOF_DETECT_M:
-            self.obstacle = True
-            rospy.loginfo("[navigator] obstacle at %.2f m", msg.range)
-        elif self.obstacle and msg.range > TOF_CLEAR_M:
-            self.obstacle = False
-            rospy.loginfo("[navigator] obstacle cleared (%.2f m)", msg.range)
+
+        # Three bands, not two. Between DETECT and CLEAR we hold whatever we already
+        # decided -- that gap is the hysteresis.
+        if msg.range < TOF_DETECT_M:
+            # A single short reading is NOT enough. Anything bright and flat that the
+            # beam clips -- an AprilTag on the road especially, since white reflects far
+            # better than dark tape and returns a strong signal where asphalt returns
+            # none -- produces a brief spike as the bot drives past. A real obstacle
+            # stands in front of us and keeps reading short. So require the reading to
+            # persist before believing it.
+            self.tof_near_count += 1
+            if not self.obstacle and self.tof_near_count >= TOF_CONFIRM_FRAMES:
+                self.obstacle = True
+                rospy.loginfo("[navigator] obstacle at %.2f m (%d consecutive readings)",
+                              msg.range, self.tof_near_count)
+        elif msg.range > TOF_CLEAR_M:
+            self.tof_near_count = 0
+            if self.obstacle:
+                self.obstacle = False
+                rospy.loginfo("[navigator] obstacle cleared (%.2f m)", msg.range)
+
+    def update_live_tile(self, frame):
+        """
+        Read whatever tag is in view and remember which tile it means.
+
+        Unlike localize(), this takes no vote across frames -- it runs continuously, so
+        a single bad frame is corrected by the next one a fifth of a second later. The
+        protection instead is a HIGHER margin threshold: we would rather show nothing
+        than show the robot on the wrong tile.
+        """
+        gray = np.ascontiguousarray(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
+        # Non-blocking: if localize() already holds the detector, skip this frame
+        # rather than wait. Another one arrives in a fifth of a second.
+        if not self.detector_lock.acquire(False):
+            return
+        try:
+            tags = self.tag_detector.detect(gray)
+        finally:
+            self.detector_lock.release()
+        if not tags:
+            return
+        best = max(tags, key=lambda t: t.decision_margin)
+        if best.decision_margin < LIVE_MIN_MARGIN:
+            return
+        info = self.tag_map.get(str(int(best.tag_id))) if self.tag_map else None
+        if not info:
+            return
+        prev = self.live_tile
+        self.live_tile = {"row": info["row"], "col": info["col"],
+                          "tag_id": int(best.tag_id),
+                          "confidence": round(float(best.decision_margin), 1),
+                          "age_s": 0.0, "t": time.time()}
+        if not prev or (prev["row"], prev["col"]) != (info["row"], info["col"]):
+            rospy.loginfo("[navigator] live tile -> (%d,%d) tag %d",
+                          info["row"], info["col"], int(best.tag_id))
+
+    def live_tile_status(self):
+        """live_tile with a freshness stamp, or None once it goes stale."""
+        lt = self.live_tile
+        if not lt:
+            return None
+        age = time.time() - lt["t"]
+        if age > LIVE_STALE_S:
+            return None
+        out = dict(lt)
+        out["age_s"] = round(age, 1)
+        return out
 
     def tof_alive(self):
         """False if the sensor has gone quiet -- better to say so than silently coast."""
@@ -712,7 +831,8 @@ class Navigator:
             return {"localized": False, "reason": "apriltag localization disabled"}
         if self.tag_detector is None:
             return {"localized": False,
-                    "reason": "pupil_apriltags not installed on the bot"}
+                    "reason": "no apriltag library on the bot "
+                              "(pip install dt-apriltags)"}
         if self.tag_map is None:
             return {"localized": False,
                     "reason": "apriltag_map.json missing or unreadable"}
@@ -749,8 +869,9 @@ class Navigator:
             if frame is None:
                 break           # camera went quiet: judge from what we already have
             frames_seen += 1
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            tags = self.tag_detector.detect(gray)
+            gray = np.ascontiguousarray(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
+            with self.detector_lock:
+                tags = self.tag_detector.detect(gray)
             if not tags:
                 continue
             frames_with_tag += 1
