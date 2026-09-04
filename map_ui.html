@@ -8,19 +8,19 @@
   :root{
     --bg:#f6f7f9; --panel:#fff; --ink:#15181d; --muted:#5d6672; --line:#dfe3e9;
     --road:#4a5059; --grass:#eceff3; --accent:#2f6fed; --start:#1e9e5a;
-    --goal:#d8443c; --stop:#e0342b; --chip:#eef2fb;
+    --goal:#d8443c; --stop:#e0342b; --chip:#eef2fb; --live:#8b3df5;
   }
   @media (prefers-color-scheme:dark){
     :root:not([data-theme="light"]){
       --bg:#14161a; --panel:#1c1f25; --ink:#e9ecf1; --muted:#98a2b2; --line:#2c313a;
       --road:#59616d; --grass:#22262d; --accent:#6f9bff; --start:#35c47c;
-      --goal:#ff6b60; --stop:#ff5449; --chip:#242c3d;
+      --goal:#ff6b60; --stop:#ff5449; --chip:#242c3d; --live:#b98cff;
     }
   }
   :root[data-theme="dark"]{
     --bg:#14161a; --panel:#1c1f25; --ink:#e9ecf1; --muted:#98a2b2; --line:#2c313a;
     --road:#59616d; --grass:#22262d; --accent:#6f9bff; --start:#35c47c;
-    --goal:#ff6b60; --stop:#ff5449; --chip:#242c3d;
+    --goal:#ff6b60; --stop:#ff5449; --chip:#242c3d; --live:#b98cff;
   }
   *{box-sizing:border-box}
   body{margin:0;background:var(--bg);color:var(--ink);
@@ -106,10 +106,12 @@
         <h2>Plan</h2>
         <div class="row">
           <button id="locate">Locate robot</button>
+          <button id="live">Live tracking</button>
           <span style="font-size:12.5px;color:var(--muted)">reads the floor AprilTag,
             fills in the start tile</span>
         </div>
         <div id="loc"></div>
+        <div id="livebox"></div>
         <div class="row">
           <span style="font-size:13px;color:var(--muted)">Facing:</span>
           <button data-f="N">N ↑</button><button data-f="E">E →</button>
@@ -373,9 +375,73 @@ function draw(){
     <text x="0" y="-21" text-anchor="middle" font-size="9"
       fill="var(--muted)">N = row 0</text></g>`);
 
+  // Live position, drawn LAST so it sits on top of the route. Comes from the robot
+  // reading the AprilTag on whatever tile it is currently over.
+  if(liveTile){
+    const [x,y] = px(liveTile.row, liveTile.col);
+    const cx = x+SZ/2, cy = y+SZ/2;
+    parts.push(`<circle cx="${cx}" cy="${cy}" r="21" fill="var(--live)"
+      opacity=".22"><animate attributeName="r" values="18;25;18" dur="1.6s"
+      repeatCount="indefinite"/></circle>`);
+    parts.push(`<circle cx="${cx}" cy="${cy}" r="11" fill="var(--live)"
+      stroke="#fff" stroke-width="2.5"/>`);
+    parts.push(`<text x="${cx}" y="${cy-26}" text-anchor="middle" font-size="10"
+      font-weight="700" fill="var(--live)">BOT</text>`);
+  }
+
   svg.innerHTML = parts.join("");
   svg.querySelectorAll(".tile-hit").forEach(el =>
     el.addEventListener("click", () => pick(+el.dataset.r, +el.dataset.c)));
+}
+
+// ---------------------------------------------------------------------------
+// Live tracking: poll /status and show which tile the robot is on. Polling is
+// started by the user, not automatically -- an idle browser tab should not sit
+// there hitting the robot's HTTP server while it is trying to drive.
+// ---------------------------------------------------------------------------
+let liveTile = null, liveTimer = null;
+
+async function pollLive(){
+  try{
+    const r = await fetch(base()+"/status");
+    const j = await r.json();
+    const box = document.getElementById("livebox");
+    if(!j.live_tracking){
+      liveTile = null;
+      box.innerHTML = `<div class="msg err">Live tracking is switched off on the
+        robot. Restart it with <code>export LIVE_TRACKING=1</code> before
+        <code>python3 /data/navigator.py</code>.</div>`;
+      stopLive();
+    }else if(j.live_tile){
+      liveTile = j.live_tile;
+      box.innerHTML = `<div class="msg ok">On tile
+        <b>(${j.live_tile.row}, ${j.live_tile.col})</b> &middot; tag
+        ${j.live_tile.tag_id} &middot; confidence ${j.live_tile.confidence}
+        &middot; ${j.live_tile.age_s}s ago &middot; state ${j.state}</div>`;
+    }else{
+      liveTile = null;
+      box.innerHTML = `<div class="msg">No tag in view right now &middot; state
+        ${j.state}. The robot only knows its tile while a tag is under the
+        camera.</div>`;
+    }
+    draw();
+  }catch(e){
+    document.getElementById("livebox").innerHTML =
+      `<div class="msg err">Lost contact with the robot: ${e.message}</div>`;
+  }
+}
+
+function startLive(){
+  if(liveTimer) return;
+  liveTimer = setInterval(pollLive, 1000);
+  pollLive();
+  document.getElementById("live").textContent = "Stop live tracking";
+  document.getElementById("live").classList.add("on");
+}
+function stopLive(){
+  clearInterval(liveTimer); liveTimer = null;
+  document.getElementById("live").textContent = "Live tracking";
+  document.getElementById("live").classList.remove("on");
 }
 
 function validFacings(rc){ return rc ? Object.keys(TC[key(rc[0],rc[1])]) : []; }
@@ -524,6 +590,9 @@ document.getElementById("swap").addEventListener("click", () => {
   const v = validFacings(start);
   if(!v.includes(facing)) facing = v[0];
   replan();
+});
+document.getElementById("live").addEventListener("click", () => {
+  if(liveTimer) stopLive(); else startLive();
 });
 document.getElementById("host").addEventListener("input", replan);
 

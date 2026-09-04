@@ -45,10 +45,18 @@ import time
 import cv2
 import numpy as np
 
-try:
-    from pupil_apriltags import Detector
-except ImportError:
-    sys.exit("pupil_apriltags is not installed. Run:  pip install pupil-apriltags")
+# dt_apriltags is Duckietown's fork of the same AprilTag3 bindings and is the one that
+# installs on these robots: pupil_apriltags has no prebuilt aarch64 wheel, so pip falls
+# back to compiling it and the build fails on this image. Either library works here.
+Detector = None
+for _lib in ("dt_apriltags", "pupil_apriltags"):
+    try:
+        Detector = __import__(_lib, fromlist=["Detector"]).Detector
+        break
+    except ImportError:
+        pass
+if Detector is None:
+    sys.exit("No AprilTag library found. On the bot run:  pip install dt-apriltags")
 
 CAPTURE_DIR = "apriltag_test_captures"
 PROCESS_EVERY_S = 0.5   # ~2 Hz in --live mode; a test script needn't hammer the CPU
