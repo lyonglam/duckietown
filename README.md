@@ -170,10 +170,9 @@ ramped across the centreline and back, rather than running an open-loop manoeuvr
 
 ## Known limitations
 
-- **The AprilTags are not physically placed yet.** `apriltag_map.json` and `/localize`
-  are complete in software; validate with `apriltag_scan_test.py` once the tags are up.
-- **Tag position is displayed, not used.** Route progress is still stop-line counting.
-  Using the tag to correct a disagreement is the obvious next step.
+- **Tag position is displayed, not used for correction.** All 30 tags are placed and
+  `/localize` returns the correct tile on the robot, but route progress is still
+  stop-line counting. Using the tag to correct a disagreement is the obvious next step.
 - **Turn completion ends on lane visibility**, not wheel encoders.
 - **Obstacles are swerved around, never waited for.** No stop-and-wait behaviour.
 
